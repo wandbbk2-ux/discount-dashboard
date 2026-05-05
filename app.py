@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 from typing import Dict, Tuple, Optional
+from datetime import datetime, timedelta
+import os
 
 # ------------------------------
 # 1. Загрузка данных артикулов
@@ -9,33 +11,58 @@ from typing import Dict, Tuple, Optional
 def load_sku_data(file_path: str) -> pd.DataFrame:
     """Загружает Excel-файл с колонками Артикул, Level 02, Level 03, Level 04, Модель"""
     df = pd.read_excel(file_path, engine='openpyxl')
-    # Приводим колонки к стандартным названиям
     df.columns = df.columns.str.strip()
-    # Если колонка с артикулом называется 'Артикул', переименуем для удобства
     if 'Артикул' in df.columns:
         df.rename(columns={'Артикул': 'sku'}, inplace=True)
-    # Убираем возможные пустые строки
     df.dropna(subset=['sku'], inplace=True)
     df['sku'] = df['sku'].astype(str).str.strip()
     return df
 
-# Попытка загрузить файл по умолчанию
+# ------------------------------
+# 2. Загрузка и сохранение лога компенсаций
+# ------------------------------
+LOG_FILE = "compensation_log.xlsx"
+
+def load_log() -> pd.DataFrame:
+    """Загружает существующий лог или создаёт новый"""
+    if os.path.exists(LOG_FILE):
+        df = pd.read_excel(LOG_FILE, engine='openpyxl')
+        if 'Дата и время' in df.columns:
+            df['Дата и время'] = pd.to_datetime(df['Дата и время'], errors='coerce')
+        return df
+    else:
+        df = pd.DataFrame(columns=[
+            'Дата и время', 'Артикул', 'Модель', 'Категория L2', 'Категория L3', 'Категория L4',
+            'Цена', 'Локация повреждения', 'Тип повреждения', 'Размер', 'Влияет на функциональность',
+            'Мин скидка %', 'Макс скидка %', 'Предложенная скидка %', 
+            'Маркетплейс', 'Промокод', 'Номер заказа', 'Статус'
+        ])
+        return df
+
+def save_to_log(data: dict):
+    """Сохраняет запись о согласии клиента в Excel"""
+    df = load_log()
+    new_row = pd.DataFrame([data])
+    df = pd.concat([df, new_row], ignore_index=True)
+    df.to_excel(LOG_FILE, index=False, engine='openpyxl')
+
+# ------------------------------
+# 3. Загрузка файла артикулов
+# ------------------------------
 DEFAULT_FILE = "Список товарных групп.xlsx"
 df_skus = None
-if st.sidebar.checkbox("Загрузить свой файл артикулов"):
-    uploaded_file = st.sidebar.file_uploader("Выберите Excel-файл", type=['xlsx'])
+
+try:
+    df_skus = load_sku_data(DEFAULT_FILE)
+    st.sidebar.success(f"Загружен файл: {DEFAULT_FILE}")
+except FileNotFoundError:
+    st.sidebar.error("Файл по умолчанию не найден. Пожалуйста, загрузите файл вручную.")
+    uploaded_file = st.sidebar.file_uploader("Выберите Excel-файл с артикулами", type=['xlsx'])
     if uploaded_file:
         df_skus = load_sku_data(uploaded_file)
         st.sidebar.success("Файл загружен")
     else:
-        st.sidebar.info("Пожалуйста, загрузите файл")
-else:
-    try:
-        df_skus = load_sku_data(DEFAULT_FILE)
-        st.sidebar.success(f"Загружен файл по умолчанию: {DEFAULT_FILE}")
-    except FileNotFoundError:
-        st.sidebar.error("Файл по умолчанию не найден. Пожалуйста, загрузите файл вручную.")
-        df_skus = None
+        st.stop()
 
 if df_skus is None:
     st.stop()
@@ -43,7 +70,7 @@ if df_skus is None:
 # Создаём словарь для быстрого поиска по артикулу
 sku_to_info = {}
 for _, row in df_skus.iterrows():
-    sku = row['sku']
+    sku = str(row['sku']).strip()
     sku_to_info[sku] = {
         'level02': row.get('Level 02', ''),
         'level03': row.get('Level 03', ''),
@@ -52,15 +79,15 @@ for _, row in df_skus.iterrows():
     }
 
 # ------------------------------
-# 2. Конфигурация чеклистов и правил скидок
+# 4. Конфигурация чеклистов
 # ------------------------------
-# Определяем возможные вопросы
 QUESTIONS = {
     'location': {
         'label': 'Где расположено повреждение?',
         'options': [
             'Лицевая часть', 'Боковая часть', 'Тыльная часть',
-            'Экран', 'Корпус', 'Дверца', 'Клавиатура', 'Рамка'
+            'Экран', 'Корпус', 'Дверца', 'Клавиатура', 'Рамка',
+            'Камера', 'Дисплей', 'Панель управления'
         ]
     },
     'type': {
@@ -69,7 +96,7 @@ QUESTIONS = {
     },
     'size': {
         'label': 'Размер повреждения (для царапин/сколов/трещин)?',
-        'options': ['До 1 см', '1–3 см', '3–5 см', 'Более 5 см']
+        'options': ['До 1 см', '1–3 см', '3–5 см', 'Более 5 см', 'Любой']
     },
     'functional': {
         'label': 'Влияет ли на функциональность?',
@@ -77,23 +104,22 @@ QUESTIONS = {
     }
 }
 
-# Настройка чеклиста для каждой группы (ключ – Level 04)
 CHECKLISTS = {
     'Ноутбуки': {
         'questions': ['location', 'type', 'size', 'functional'],
-        'location_options': ['Экран', 'Корпус (верх)', 'Корпус (низ)', 'Клавиатура', 'Петли', 'Торцы']
+        'location_options': ['Экран', 'Корпус (верхняя крышка)', 'Корпус (нижняя часть)', 'Клавиатура', 'Петли', 'Торцы']
     },
     'Смартфоны': {
         'questions': ['location', 'type', 'size', 'functional'],
         'location_options': ['Экран', 'Задняя крышка', 'Рамка', 'Камера']
     },
-    'Встр. Духовка': {
+    'Планшеты': {
         'questions': ['location', 'type', 'size', 'functional'],
-        'location_options': ['Лицевая часть (стекло/панель)', 'Боковая часть', 'Тыльная часть', 'Внутренняя камера']
+        'location_options': ['Экран', 'Корпус']
     },
-    'Холодильники': {
-        'questions': ['location', 'type', 'size'],
-        'location_options': ['Лицевая дверца', 'Боковая стенка', 'Внутренняя полка', 'Ручка']
+    'Телевизоры (LCD TV)': {
+        'questions': ['location', 'type', 'size', 'functional'],
+        'location_options': ['Экран', 'Корпус', 'Подставка']
     },
     'default': {
         'questions': ['location', 'type', 'size', 'functional'],
@@ -101,55 +127,20 @@ CHECKLISTS = {
     }
 }
 
-# Правила скидок: ключ – (level04, location, type, size, functional) -> (min, max)
-RULES = {
-    # Ноутбуки
-    ('Ноутбуки', 'Экран', 'Царапина', 'До 1 см', 'Нет'): (5, 8),
-    ('Ноутбуки', 'Экран', 'Царапина', '1–3 см', 'Нет'): (8, 12),
-    ('Ноутбуки', 'Экран', 'Царапина', '3–5 см', 'Нет'): (12, 18),
-    ('Ноутбуки', 'Экран', 'Трещина', 'Любой', 'Нет'): (20, 30),
-    ('Ноутбуки', 'Экран', 'Трещина', 'Любой', 'Да'): (40, 50),
-    ('Ноутбуки', 'Корпус (верх)', 'Царапина', 'До 3 см', 'Нет'): (3, 5),
-    ('Ноутбуки', 'Корпус (верх)', 'Царапина', '3–5 см', 'Нет'): (5, 8),
-    ('Ноутбуки', 'Корпус (верх)', 'Вмятина', 'Любой', 'Нет'): (8, 12),
-    # Смартфоны
-    ('Смартфоны', 'Экран', 'Царапина', 'До 1 см', 'Нет'): (8, 12),
-    ('Смартфоны', 'Экран', 'Царапина', '1–3 см', 'Нет'): (12, 18),
-    ('Смартфоны', 'Экран', 'Царапина', '3–5 см', 'Нет'): (15, 20),
-    ('Смартфоны', 'Экран', 'Трещина', 'Любой', 'Нет'): (25, 35),
-    ('Смартфоны', 'Экран', 'Трещина', 'Любой', 'Да'): (40, 50),
-    ('Смартфоны', 'Задняя крышка', 'Царапина', 'Любой', 'Нет'): (5, 10),
-    ('Смартфоны', 'Рамка', 'Вмятина', 'Любой', 'Нет'): (8, 12),
-    # Встраиваемая техника (духовка)
-    ('Встр. Духовка', 'Лицевая часть (стекло/панель)', 'Царапина', 'До 2 см', 'Нет'): (3, 5),
-    ('Встр. Духовка', 'Лицевая часть (стекло/панель)', 'Царапина', '2–5 см', 'Нет'): (7, 10),
-    ('Встр. Духовка', 'Лицевая часть (стекло/панель)', 'Царапина', 'Более 5 см', 'Нет'): (12, 15),
-    ('Встр. Духовка', 'Лицевая часть (стекло/панель)', 'Трещина', 'Любой', 'Нет'): (20, 30),
-    ('Встр. Духовка', 'Лицевая часть (стекло/панель)', 'Трещина', 'Любой', 'Да'): (40, 50),
-    ('Встр. Духовка', 'Боковая часть', 'Царапина', 'Любой', 'Нет'): (2, 4),
-    ('Встр. Духовка', 'Тыльная часть', 'Царапина', 'Любой', 'Нет'): (1, 3),
-    # Холодильники
-    ('Холодильники', 'Лицевая дверца', 'Царапина', 'До 5 см', 'Нет'): (3, 5),
-    ('Холодильники', 'Лицевая дверца', 'Царапина', 'Более 5 см', 'Нет'): (5, 8),
-    ('Холодильники', 'Боковая стенка', 'Царапина', 'Любой', 'Нет'): (2, 4),
-    ('Холодильники', 'Лицевая дверца', 'Вмятина', 'Любой', 'Нет'): (8, 12),
-    # Общие правила (для остальных групп)
-    ('default', 'Лицевая часть', 'Царапина', 'До 2 см', 'Нет'): (2, 4),
-    ('default', 'Лицевая часть', 'Царапина', '2–5 см', 'Нет'): (5, 8),
-    ('default', 'Лицевая часть', 'Царапина', 'Более 5 см', 'Нет'): (8, 12),
-    ('default', 'Боковая часть', 'Царапина', 'Любой', 'Нет'): (1, 3),
-    ('default', 'Тыльная часть', 'Царапина', 'Любой', 'Нет'): (1, 2),
-}
-
-# Дополнительная логика для отсутствия комплектующих
-def handle_missing_part(part_name: str, part_price: float, product_price: float) -> Tuple[float, float]:
-    """Возвращает мин/макс скидку на основе стоимости детали"""
-    percent = (part_price / product_price) * 100 + 5
-    percent = min(percent, 15)  # не более 15%
-    return (percent, percent)
+# Список маркетплейсов
+MARKETPLACES_LIST = ["Ozon", "Yandex Market", "Wildberries"]
 
 # ------------------------------
-# 3. Функция для расчёта скидки
+# 5. Логотипы маркетплейсов
+# ------------------------------
+MARKETPLACES = {
+    "Ozon": {"emoji": "💙🌸", "name": "Ozon"},
+    "Yandex Market": {"emoji": "🟡", "name": "Yandex Market"},
+    "Wildberries": {"emoji": "🟣", "name": "Wildberries"}
+}
+
+# ------------------------------
+# 6. Функция для расчёта скидки с дефолтными правилами
 # ------------------------------
 def get_discount_range(
     level04: str,
@@ -161,47 +152,210 @@ def get_discount_range(
     missing_part: Optional[Tuple[str, float]] = None
 ) -> Tuple[float, float]:
     """Возвращает (min_discount, max_discount) в процентах"""
-    if missing_part:
-        return handle_missing_part(*missing_part, product_price)
-
-    # Сначала ищем точное совпадение
-    key = (level04, location, damage_type, size, functional)
-    if key in RULES:
-        return RULES[key]
-
-    # Если не нашли, пробуем с заменой размера на 'Любой'
-    key = (level04, location, damage_type, 'Любой', functional)
-    if key in RULES:
-        return RULES[key]
-
-    # Иначе ищем в default
-    key = ('default', location, damage_type, size, functional)
-    if key in RULES:
-        return RULES[key]
-
-    key = ('default', location, damage_type, 'Любой', functional)
-    if key in RULES:
-        return RULES[key]
-
-    # Если ничего не подошло, возвращаем 0
-    return (0, 0)
+    
+    if damage_type == 'Отсутствует комплектующее' and missing_part:
+        percent = (missing_part[1] / product_price) * 100 + 5
+        percent = min(percent, 15)
+        percent = round(percent / 5) * 5
+        return (percent, percent)
+    
+    if damage_type == 'Царапина':
+        if functional == 'Нет':
+            return (5, 10)
+        else:
+            return (10, 15)
+    elif damage_type == 'Скол':
+        if functional == 'Нет':
+            return (10, 15)
+        else:
+            return (15, 20)
+    elif damage_type == 'Вмятина':
+        if functional == 'Нет':
+            return (15, 20)
+        else:
+            return (20, 25)
+    elif damage_type == 'Трещина':
+        if functional == 'Нет':
+            return (25, 30)
+        else:
+            return (30, 35)
+    elif damage_type == 'Повреждение упаковки':
+        return (1, 3)
+    else:
+        return (5, 10)
 
 # ------------------------------
-# 4. Интерфейс Streamlit
+# 7. Функция для фильтрации отчёта
+# ------------------------------
+def filter_report(df: pd.DataFrame, start_date: datetime, end_date: datetime, marketplace: str) -> pd.DataFrame:
+    """Фильтрует отчёт по дате и маркетплейсу"""
+    if df.empty:
+        return df
+    
+    mask_date = (df['Дата и время'] >= start_date) & (df['Дата и время'] <= end_date)
+    filtered = df[mask_date]
+    
+    if marketplace != "Все":
+        filtered = filtered[filtered['Маркетплейс'] == marketplace]
+    
+    return filtered
+
+# ------------------------------
+# 8. Интерфейс Streamlit
 # ------------------------------
 st.set_page_config(page_title="Система компенсаций", layout="wide")
 st.title("📦 Определение компенсации за повреждения")
 
-# Поле ввода артикула
-sku_input = st.text_input("Введите артикул товара", placeholder="Например: 500964")
+# ==================== БОКОВАЯ ПАНЕЛЬ С ОТЧЁТАМИ ====================
+st.sidebar.header("📊 Отчёты")
+
+log_df = load_log()
+
+if not log_df.empty:
+    # Статистика по маркетплейсам
+    st.sidebar.subheader("📈 Статистика по площадкам")
+    marketplace_counts = log_df['Маркетплейс'].value_counts()
+    for mp, count in marketplace_counts.items():
+        emoji = MARKETPLACES.get(mp, {}).get("emoji", "🛒")
+        st.sidebar.metric(f"{emoji} {mp}", count)
+    
+    st.sidebar.divider()
+    
+    # Фильтр по дате
+    st.sidebar.subheader("📅 Фильтр по дате")
+    
+    period = st.sidebar.selectbox(
+        "Выберите период",
+        options=["Сегодня", "Вчера", "Последние 7 дней", "Последние 30 дней", "Этот месяц", "Прошлый месяц", "Произвольный"]
+    )
+    
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    if period == "Сегодня":
+        start_date = today
+        end_date = today + timedelta(days=1) - timedelta(seconds=1)
+        st.sidebar.info(f"📅 {start_date.strftime('%d.%m.%Y')}")
+        
+    elif period == "Вчера":
+        start_date = today - timedelta(days=1)
+        end_date = today - timedelta(seconds=1)
+        st.sidebar.info(f"📅 {start_date.strftime('%d.%m.%Y')}")
+        
+    elif period == "Последние 7 дней":
+        start_date = today - timedelta(days=7)
+        end_date = today + timedelta(days=1) - timedelta(seconds=1)
+        st.sidebar.info(f"📅 {start_date.strftime('%d.%m.%Y')} – {today.strftime('%d.%m.%Y')}")
+        
+    elif period == "Последние 30 дней":
+        start_date = today - timedelta(days=30)
+        end_date = today + timedelta(days=1) - timedelta(seconds=1)
+        st.sidebar.info(f"📅 {start_date.strftime('%d.%m.%Y')} – {today.strftime('%d.%m.%Y')}")
+        
+    elif period == "Этот месяц":
+        start_date = today.replace(day=1)
+        end_date = today + timedelta(days=1) - timedelta(seconds=1)
+        st.sidebar.info(f"📅 {start_date.strftime('%d.%m.%Y')} – {today.strftime('%d.%m.%Y')}")
+        
+    elif period == "Прошлый месяц":
+        first_day_this_month = today.replace(day=1)
+        last_day_last_month = first_day_this_month - timedelta(days=1)
+        start_date = last_day_last_month.replace(day=1)
+        end_date = last_day_last_month
+        st.sidebar.info(f"📅 {start_date.strftime('%d.%m.%Y')} – {end_date.strftime('%d.%m.%Y')}")
+        
+    else:
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            start_date = st.date_input("От", today - timedelta(days=30))
+        with col2:
+            end_date = st.date_input("До", today)
+        start_date = datetime.combine(start_date, datetime.min.time())
+        end_date = datetime.combine(end_date, datetime.max.time())
+        st.sidebar.caption(f"📅 {start_date.strftime('%d.%m.%Y')} – {end_date.strftime('%d.%m.%Y')}")
+    
+    # Фильтр по маркетплейсу
+    st.sidebar.subheader("🏪 Фильтр по маркетплейсу")
+    marketplace_filter = st.sidebar.selectbox(
+        "Маркетплейс",
+        options=["Все"] + MARKETPLACES_LIST
+    )
+    
+    # Применяем фильтры
+    filtered_df = filter_report(log_df, start_date, end_date, marketplace_filter)
+    
+    # Показываем статистику
+    st.sidebar.divider()
+    st.sidebar.subheader("📊 Результат фильтрации")
+    st.sidebar.metric("Всего записей", len(filtered_df))
+    
+    if not filtered_df.empty:
+        avg_discount = filtered_df['Предложенная скидка %'].mean()
+        st.sidebar.metric("Средняя скидка", f"{avg_discount:.0f}%")
+        
+        csv_data = filtered_df.to_csv(index=False, sep=';', encoding='utf-8-sig')
+        
+        date_str = start_date.strftime("%Y%m%d")
+        end_str = end_date.strftime("%Y%m%d")
+        market_str = marketplace_filter if marketplace_filter != "Все" else "all"
+        filename = f"compensation_report_{date_str}_{end_str}_{market_str}.csv"
+        
+        st.sidebar.download_button(
+            label=f"📥 Скачать отчёт ({len(filtered_df)} записей)",
+            data=csv_data,
+            file_name=filename,
+            mime="text/csv",
+            help=f"Отчёт за период {start_date.strftime('%d.%m.%Y')} – {end_date.strftime('%d.%m.%Y')} по маркетплейсу {marketplace_filter}"
+        )
+        
+        # Excel версия
+        filtered_df.to_excel("temp_filtered.xlsx", index=False, engine='openpyxl')
+        with open("temp_filtered.xlsx", "rb") as f:
+            st.sidebar.download_button(
+                label="📊 Скачать отчёт (Excel)",
+                data=f,
+                file_name=filename.replace('.csv', '.xlsx'),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        os.remove("temp_filtered.xlsx")
+    
+    st.sidebar.divider()
+    
+    # Полный отчёт
+    if st.sidebar.button("📋 Полный отчёт (Excel)"):
+        log_df.to_excel("compensation_report_full.xlsx", index=False, engine='openpyxl')
+        with open("compensation_report_full.xlsx", "rb") as f:
+            st.sidebar.download_button(
+                label="✅ Полный отчёт",
+                data=f,
+                file_name="compensation_report_full.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    
+    # Последние 5 записей
+    st.sidebar.divider()
+    st.sidebar.subheader("🕐 Последние действия")
+    if not log_df.empty:
+        last_5 = log_df.tail(5)
+        for _, row in last_5.iterrows():
+            date_str = row['Дата и время'].strftime("%d.%m.%Y %H:%M") if hasattr(row['Дата и время'], 'strftime') else str(row['Дата и время'])[:16]
+            marketplace = row.get('Маркетплейс', '—')
+            emoji = MARKETPLACES.get(marketplace, {}).get("emoji", "🛒")
+            st.sidebar.caption(f"{emoji} **{row['Артикул']}** → {row['Предложенная скидка %']}% | {date_str}")
+    
+else:
+    st.sidebar.info("Пока нет записей о согласиях. После первой фиксации здесь появится отчёт.")
+
+# ==================== ОСНОВНАЯ ЧАСТЬ ====================
+
+sku_input = st.text_input("Введите артикул товара", placeholder="Например: 470591")
 
 if sku_input:
+    sku_input = str(sku_input).strip()
     sku_info = sku_to_info.get(sku_input)
     if not sku_info:
         st.error("Артикул не найден в базе. Пожалуйста, проверьте ввод.")
         st.stop()
 
-    # Отображаем информацию о товаре
     st.subheader("Информация о товаре")
     col1, col2 = st.columns(2)
     with col1:
@@ -210,26 +364,24 @@ if sku_input:
         st.write(f"**Категория (L3):** {sku_info['level03']}")
     with col2:
         st.write(f"**Категория (L4):** {sku_info['level04']}")
-        # В реальной системе можно подтянуть цену из другой таблицы, пока просим вручную
         price = st.number_input("Цена товара (тенге)", min_value=0.0, value=100000.0, step=1000.0)
 
-    # Определяем, какой чеклист использовать
     level04 = sku_info['level04']
     checklist = CHECKLISTS.get(level04, CHECKLISTS['default'])
     st.subheader("Опишите повреждение")
 
-    # Динамические вопросы
     answers = {}
     for q_name in checklist['questions']:
         q_data = QUESTIONS[q_name]
         if q_name == 'location':
-            # Используем специфичные для группы варианты
             options = checklist.get('location_options', q_data['options'])
             answers[q_name] = st.selectbox(q_data['label'], options)
         else:
             answers[q_name] = st.selectbox(q_data['label'], q_data['options'])
+    
+    if answers.get('size') == '' or answers.get('size') is None:
+        answers['size'] = 'Любой'
 
-    # Особый случай: отсутствие комплектующего
     missing_part = None
     if answers['type'] == 'Отсутствует комплектующее':
         st.info("Укажите недостающую деталь")
@@ -252,16 +404,101 @@ if sku_input:
                 price,
                 missing_part
             )
+            
             if min_d == 0 and max_d == 0:
-                st.warning("Для данной комбинации повреждений нет настроенных правил. Обратитесь к администратору.")
+                st.warning("Для данной комбинации повреждений нет настроенных правил.")
             else:
-                st.success(f"**Рекомендуемая скидка:** {min_d:.0f}% – {max_d:.0f}%")
-                st.info(f"**Стартовая компенсация:** {(min_d+max_d)/2:.0f}%")
+                mid = int((min_d + max_d) / 2)
+                st.success(f"**Рекомендуемая скидка:** {int(min_d)}% – {int(max_d)}%")
+                st.info(f"**Стартовая компенсация:** {mid}%")
 
-                # Кнопка копирования предложения
-                proposal = f"Здравствуйте! По вашему обращению о повреждении ({answers['location']}, {answers['type']}) мы можем предложить компенсацию в размере {int((min_d+max_d)/2)}% от стоимости товара. Если вы готовы оставить товар, сообщите нам."
+                if answers['type'] == 'Отсутствует комплектующее' and missing_part:
+                    proposal = f"Здравствуйте! По вашему обращению: отсутствует комплектующее ({missing_part[0]}). Мы можем предложить компенсацию в размере {mid}% от стоимости товара для приобретения недостающей детали. Если вы готовы оставить товар, сообщите нам."
+                else:
+                    proposal = f"Здравствуйте! По вашему обращению о повреждении ({answers['location']}, {answers['type']} размер {answers.get('size', '')}) мы можем предложить компенсацию в размере {mid}% от стоимости товара. Если вы готовы оставить товар, сообщите нам."
+                
                 st.code(proposal, language='text')
-                st.button("Скопировать предложение", on_click=lambda: st.write("Для копирования выделите текст выше"))
+                
+                # Сохраняем расчёт в session_state
+                st.session_state['calculation'] = {
+                    'sku': sku_input,
+                    'model': sku_info['model'],
+                    'level02': sku_info['level02'],
+                    'level03': sku_info['level03'],
+                    'level04': sku_info['level04'],
+                    'price': price,
+                    'location': answers['location'],
+                    'damage_type': answers['type'],
+                    'size': answers.get('size', 'Любой'),
+                    'functional': answers.get('functional', 'Нет'),
+                    'min_discount': int(min_d),
+                    'max_discount': int(max_d),
+                    'proposed_discount': mid,
+                    'missing_part': missing_part[0] if missing_part else None,
+                    'missing_part_price': missing_part[1] if missing_part else None
+                }
+                
+                # Показываем форму согласия
+                st.session_state['show_agreement'] = True
 
+    # Форма согласия клиента
+    if st.session_state.get('show_agreement', False):
+        st.divider()
+        st.subheader("✅ Фиксация согласия клиента")
+        
+        with st.form("agreement_form"):
+            # Выбор маркетплейса с логотипом
+            marketplace_options = list(MARKETPLACES.keys())
+            marketplace_labels = [f"{MARKETPLACES[m]['emoji']} {MARKETPLACES[m]['name']}" for m in marketplace_options]
+            
+            selected_label = st.selectbox(
+                "Маркетплейс",
+                options=marketplace_labels,
+                help="Выберите площадку, на которой была предоставлена скидка"
+            )
+            # Извлекаем чистое название маркетплейса
+            selected_marketplace = selected_label.split(" ")[1] if " " in selected_label else selected_label
+            
+            promo_code = st.text_input("Промокод (если применимо)", placeholder="Например: DISCOUNT2024")
+            order_number = st.text_input("Номер заказа", placeholder="Обязательное поле")
+            
+            submitted = st.form_submit_button("✅ Подтвердить согласие клиента")
+            
+            if submitted:
+                if not order_number:
+                    st.error("Пожалуйста, введите номер заказа")
+                else:
+                    calc = st.session_state['calculation']
+                    log_entry = {
+                        'Дата и время': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        'Артикул': calc['sku'],
+                        'Модель': calc['model'],
+                        'Категория L2': calc['level02'],
+                        'Категория L3': calc['level03'],
+                        'Категория L4': calc['level04'],
+                        'Цена': calc['price'],
+                        'Локация повреждения': calc['location'],
+                        'Тип повреждения': calc['damage_type'],
+                        'Размер': calc['size'],
+                        'Влияет на функциональность': calc['functional'],
+                        'Мин скидка %': calc['min_discount'],
+                        'Макс скидка %': calc['max_discount'],
+                        'Предложенная скидка %': calc['proposed_discount'],
+                        'Маркетплейс': selected_marketplace,
+                        'Промокод': promo_code if promo_code else "",
+                        'Номер заказа': order_number,
+                        'Статус': 'Согласие получено'
+                    }
+                    
+                    save_to_log(log_entry)
+                    st.success(f"✅ Согласие зафиксировано!")
+                    st.success(f"📊 Данные сохранены в файл: {LOG_FILE}")
+                    st.balloons()
+                    
+                    # Сбрасываем флаг
+                    st.session_state['show_agreement'] = False
+                    
+                    # Показываем итоговую информацию
+                    st.info(f"**Итог:** Клиент {order_number} согласился на компенсацию {calc['proposed_discount']}% на маркетплейсе {selected_marketplace}")
 else:
     st.info("Введите артикул товара, чтобы начать.")
